@@ -80,3 +80,12 @@ Show available options:
   - `Authorization: Bearer <token>` or
   - `X-API-Token: <token>`
 - If `api_token` is empty, no auth header or extra flag is required.
+
+## License
+
+This project is licensed under **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`).
+
+- Source code must remain open and distributed under GPL-compatible terms.
+- The software is provided **as is**, without warranty of any kind (see full text in `LICENSE`).
+
+For full terms, see the [LICENSE](LICENSE) file.
