@@ -1,0 +1,4 @@
+Version = "2026-03-09r01"
+Authors = ["palaueb"]
+Name = "API Nicotine Plus"
+Description = "Local REST API to trigger Nicotine+ searches and inspect uploads/downloads, including active-only and per-user filtering."
