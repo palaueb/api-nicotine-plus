@@ -191,6 +191,7 @@ fi
 
 assert_http_and_json "GET /health" "GET" "/health" "200" "isinstance(data, dict) and data.get('status') == 'ok' and 'plugin' in data"
 assert_http_and_json "GET /status" "GET" "/status" "200" "isinstance(data, dict) and all(k in data for k in ['connected','login_status','login_username','uploads_total','downloads_total'])"
+assert_http_and_json "GET /searches (initial)" "GET" "/searches" "200" "isinstance(data.get('count'), int) and isinstance(data.get('items'), list)"
 assert_http_and_json "GET /uploads" "GET" "/uploads" "200" "data.get('direction') == 'uploads' and isinstance(data.get('items'), list) and isinstance(data.get('count'), int)"
 assert_http_and_json "GET /downloads" "GET" "/downloads" "200" "data.get('direction') == 'downloads' and isinstance(data.get('items'), list) and isinstance(data.get('count'), int)"
 assert_http_and_json "GET /uploads/users" "GET" "/uploads/users" "200" "data.get('direction') == 'uploads' and isinstance(data.get('items'), list)"
@@ -203,7 +204,15 @@ assert_http_and_json "GET /uploads?user=pepe&active_only=true" "GET" "/uploads?u
 assert_http_and_json "GET /downloads?user=pepe&active_only=true" "GET" "/downloads?user=pepe&active_only=true" "200" "data.get('direction') == 'downloads' and data.get('user') == 'pepe'"
 
 search_payload=$(printf '{"query":"%s","mode":"global","switch_page":false}' "$SEARCH_QUERY")
-assert_http_and_json "POST /search (global)" "POST" "/search" "200" "data.get('ok') is True and data.get('mode') == 'global' and data.get('query') != ''" "$search_payload"
+assert_http_and_json "POST /search (global)" "POST" "/search" "200" "data.get('ok') is True and isinstance(data.get('token'), int) and data.get('mode') == 'global' and data.get('query') != ''" "$search_payload"
+assert_http_and_json "GET /searches (after search)" "GET" "/searches" "200" "isinstance(data.get('last_token'), int) and data.get('count', 0) >= 1 and isinstance(data.get('items'), list)"
+assert_http_and_json "GET /search/results (latest)" "GET" "/search/results" "200" "isinstance(data.get('token'), int) and isinstance(data.get('items'), list) and isinstance(data.get('total'), int)"
+assert_http_and_json "GET /search/results?limit=10&offset=0" "GET" "/search/results?limit=10&offset=0" "200" "data.get('limit') == 10 and data.get('offset') == 0 and isinstance(data.get('items'), list)"
+assert_http_and_json "GET /search/results?token=999999999 (-> 400)" "GET" "/search/results?token=999999999" "400" "'error' in data"
+
+assert_http_and_json "POST /downloads/enqueue (missing fields -> 400)" "POST" "/downloads/enqueue" "400" "'error' in data" '{}'
+assert_http_and_json "POST /search/download (missing index -> 400)" "POST" "/search/download" "400" "'error' in data" '{"token":12345}'
+assert_http_and_json "POST /search/download (unknown token -> 400)" "POST" "/search/download" "400" "'error' in data" '{"token":999999999,"index":0}'
 
 assert_http_and_json "POST /search (empty query -> 400)" "POST" "/search" "400" "'error' in data" '{"query":"","mode":"global"}'
 assert_http_and_json "POST /search (bad mode -> 400)" "POST" "/search" "400" "'error' in data" '{"query":"abc","mode":"invalid"}'

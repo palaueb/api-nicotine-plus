@@ -1,6 +1,7 @@
 import json
 import queue
 import threading
+import time
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -38,6 +39,8 @@ class Plugin(BasePlugin):
             "port": 12339,
             "api_token": "",
             "default_active_only": True,
+            "max_cached_searches": 20,
+            "max_results_per_search": 5000,
         }
         self.metasettings = {
             "host": {
@@ -58,21 +61,55 @@ class Plugin(BasePlugin):
                 "description": "Default to active transfers only when active_only is omitted",
                 "type": "bool",
             },
+            "max_cached_searches": {
+                "description": "Maximum number of API-triggered searches kept in memory",
+                "type": "int",
+                "minimum": 1,
+                "maximum": 200,
+            },
+            "max_results_per_search": {
+                "description": "Maximum number of cached results per search token",
+                "type": "int",
+                "minimum": 100,
+                "maximum": 50000,
+            },
         }
 
         self._server = None
         self._server_thread = None
         self._main_thread = None
+        self._search_cache_lock = threading.Lock()
+        self._search_cache_order = []
+        self._search_cache_meta = {}
+        self._search_cache_results = {}
+        self._last_api_search_token = None
+        self._file_search_response_connected = False
 
     def init(self):
         self._main_thread = threading.current_thread()
+        if not self._file_search_response_connected:
+            events.connect("file-search-response", self._on_file_search_response)
+            self._file_search_response_connected = True
         self._start_api_server()
 
     def disable(self):
         self._stop_api_server()
+        self._disconnect_events()
 
     def shutdown_notification(self):
         self._stop_api_server()
+        self._disconnect_events()
+
+    def _disconnect_events(self):
+        if not self._file_search_response_connected:
+            return
+
+        try:
+            events.disconnect("file-search-response", self._on_file_search_response)
+        except ValueError:
+            pass
+
+        self._file_search_response_connected = False
 
     def _start_api_server(self):
         self._stop_api_server()
@@ -167,6 +204,15 @@ class Plugin(BasePlugin):
                 if route == "/status":
                     return plugin._call_main_thread(plugin._get_status)
 
+                if route == "/searches":
+                    return plugin._get_searches()
+
+                if route == "/search/results":
+                    token = self._first(query, "token")
+                    limit = self._int_param(query, "limit", 100)
+                    offset = self._int_param(query, "offset", 0)
+                    return plugin._get_search_results(token, limit=limit, offset=offset)
+
                 if route in {"/uploads", "/downloads"}:
                     direction = route.lstrip("/")
                     user = self._first(query, "user")
@@ -210,6 +256,18 @@ class Plugin(BasePlugin):
                         switch_page,
                     )
                     return result
+
+                if route == "/downloads/enqueue":
+                    return plugin._call_main_thread(
+                        plugin._enqueue_download_api,
+                        payload,
+                    )
+
+                if route == "/search/download":
+                    return plugin._call_main_thread(
+                        plugin._enqueue_download_from_search_result,
+                        payload,
+                    )
 
                 raise ValueError(f"Unknown endpoint: {route}")
 
@@ -276,6 +334,17 @@ class Plugin(BasePlugin):
 
                 return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
 
+            def _int_param(self, query, key, default):
+                raw_value = self._first(query, key)
+
+                if raw_value is None:
+                    return int(default)
+
+                try:
+                    return int(raw_value)
+                except ValueError as error:
+                    raise ValueError(f"{key} must be an integer") from error
+
             def log_message(self, _format, *_args):
                 # Keep plugin logs clean from per-request noise.
                 return
@@ -335,14 +404,279 @@ class Plugin(BasePlugin):
             switch_page=bool(switch_page),
         )
 
+        token = int(self.core.search.token)
+        timestamp = time.time()
+
+        with self._search_cache_lock:
+            self._search_cache_meta[token] = {
+                "token": token,
+                "query": query,
+                "mode": mode,
+                "room": room,
+                "users": list(users),
+                "switch_page": bool(switch_page),
+                "created_at": timestamp,
+                "result_count": 0,
+            }
+            self._search_cache_results[token] = []
+            self._last_api_search_token = token
+            self._touch_search_token(token)
+            self._prune_search_cache_locked()
+
         return {
             "ok": True,
+            "token": token,
             "query": query,
             "mode": mode,
             "room": room,
             "users": users,
             "switch_page": bool(switch_page),
         }
+
+    def _touch_search_token(self, token):
+        if token in self._search_cache_order:
+            self._search_cache_order.remove(token)
+
+        self._search_cache_order.append(token)
+
+    def _prune_search_cache_locked(self):
+        max_cached_searches = int(self.settings.get("max_cached_searches", 20))
+
+        while len(self._search_cache_order) > max_cached_searches:
+            oldest = self._search_cache_order.pop(0)
+            self._search_cache_meta.pop(oldest, None)
+            self._search_cache_results.pop(oldest, None)
+
+    def _serialize_search_result_row(self, row, msg, private):
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            return None
+
+        _code, file_path, size, *_unused = row
+        ext = row[3] if len(row) > 3 else ""
+        file_attributes = row[4] if len(row) > 4 else {}
+
+        if not isinstance(file_attributes, dict):
+            file_attributes = {}
+
+        return {
+            "username": msg.username,
+            "file_path": file_path,
+            "size": size,
+            "extension": ext,
+            "is_private": bool(private),
+            "free_upload_slots": bool(msg.freeulslots),
+            "queue_position": msg.inqueue or 0,
+            "upload_speed": msg.ulspeed or 0,
+            "file_attributes": file_attributes,
+            "received_at": time.time(),
+        }
+
+    def _on_file_search_response(self, msg):
+        token = getattr(msg, "token", None)
+
+        if token is None:
+            return
+
+        with self._search_cache_lock:
+            if token not in self._search_cache_meta:
+                # Only cache searches triggered via this API.
+                return
+
+            cached_results = self._search_cache_results.setdefault(token, [])
+            max_results = int(self.settings.get("max_results_per_search", 5000))
+
+            for private, result_list in ((False, getattr(msg, "list", None)), (True, getattr(msg, "privatelist", None))):
+                if not result_list:
+                    continue
+
+                for row in result_list:
+                    if len(cached_results) >= max_results:
+                        break
+
+                    serialized_row = self._serialize_search_result_row(row, msg, private)
+
+                    if serialized_row is not None:
+                        cached_results.append(serialized_row)
+
+            self._search_cache_meta[token]["result_count"] = len(cached_results)
+
+    def _get_searches(self):
+        with self._search_cache_lock:
+            items = [
+                dict(self._search_cache_meta[token])
+                for token in reversed(self._search_cache_order)
+                if token in self._search_cache_meta
+            ]
+
+        return {
+            "count": len(items),
+            "last_token": self._last_api_search_token,
+            "items": items,
+        }
+
+    def _get_search_results(self, token=None, limit=100, offset=0):
+        with self._search_cache_lock:
+            if token is None:
+                token = self._last_api_search_token
+            else:
+                try:
+                    token = int(token)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("token must be an integer") from error
+
+            if token is None:
+                raise ValueError("No API search has been started yet")
+
+            if token not in self._search_cache_meta:
+                raise ValueError(f"Unknown search token: {token}")
+
+            limit = max(1, min(int(limit), 1000))
+            offset = max(0, int(offset))
+
+            meta = dict(self._search_cache_meta[token])
+            all_results = self._search_cache_results.get(token, [])
+            items = all_results[offset:offset + limit]
+
+        return {
+            "token": token,
+            "query": meta["query"],
+            "mode": meta["mode"],
+            "created_at": meta["created_at"],
+            "total": len(all_results),
+            "offset": offset,
+            "limit": limit,
+            "count": len(items),
+            "items": items,
+        }
+
+    @staticmethod
+    def _normalize_file_attributes(file_attributes):
+        if file_attributes is None:
+            return None
+
+        if not isinstance(file_attributes, dict):
+            raise ValueError("file_attributes must be an object/dict")
+
+        normalized = {}
+
+        for key, value in file_attributes.items():
+            try:
+                normalized[int(key)] = value
+            except (TypeError, ValueError):
+                normalized[key] = value
+
+        return normalized
+
+    def _enqueue_download(self, username, virtual_path, folder_path=None, size=0, file_attributes=None,
+                          bypass_filter=False):
+        username = str(username or "").strip()
+        virtual_path = str(virtual_path or "").strip()
+
+        if not username:
+            raise ValueError("username is required")
+
+        if not virtual_path:
+            raise ValueError("virtual_path is required")
+
+        try:
+            size = int(size or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError("size must be an integer") from error
+
+        if size < 0:
+            raise ValueError("size must be >= 0")
+
+        file_attributes = self._normalize_file_attributes(file_attributes)
+        previous_count = len(self.core.downloads.transfers)
+
+        self.core.downloads.enqueue_download(
+            username=username,
+            virtual_path=virtual_path,
+            folder_path=folder_path,
+            size=size,
+            file_attributes=file_attributes,
+            bypass_filter=bool(bypass_filter),
+        )
+
+        transfer = self.core.downloads.transfers.get(username + virtual_path)
+        is_duplicate = (len(self.core.downloads.transfers) == previous_count)
+
+        return {
+            "ok": True,
+            "username": username,
+            "virtual_path": virtual_path,
+            "folder_path": transfer.folder_path if transfer is not None else folder_path,
+            "size": size,
+            "bypass_filter": bool(bypass_filter),
+            "queued": transfer is not None,
+            "duplicate": bool(is_duplicate),
+            "status": transfer.status if transfer is not None else None,
+        }
+
+    def _enqueue_download_api(self, payload):
+        username = payload.get("username")
+        virtual_path = payload.get("virtual_path", payload.get("file_path"))
+        folder_path = payload.get("folder_path")
+        size = payload.get("size", 0)
+        file_attributes = payload.get("file_attributes")
+        bypass_filter = bool(payload.get("bypass_filter", False))
+
+        return self._enqueue_download(
+            username=username,
+            virtual_path=virtual_path,
+            folder_path=folder_path,
+            size=size,
+            file_attributes=file_attributes,
+            bypass_filter=bypass_filter,
+        )
+
+    def _enqueue_download_from_search_result(self, payload):
+        token = payload.get("token", self._last_api_search_token)
+        result_index = payload.get("index")
+        folder_path = payload.get("folder_path")
+        bypass_filter = bool(payload.get("bypass_filter", False))
+
+        if result_index is None:
+            raise ValueError("index is required")
+
+        try:
+            result_index = int(result_index)
+        except (TypeError, ValueError) as error:
+            raise ValueError("index must be an integer") from error
+
+        if result_index < 0:
+            raise ValueError("index must be >= 0")
+
+        with self._search_cache_lock:
+            if token is None:
+                raise ValueError("No API search has been started yet")
+
+            try:
+                token = int(token)
+            except (TypeError, ValueError) as error:
+                raise ValueError("token must be an integer") from error
+
+            if token not in self._search_cache_results:
+                raise ValueError(f"Unknown search token: {token}")
+
+            items = self._search_cache_results[token]
+
+            if result_index >= len(items):
+                raise ValueError("index out of range for search results")
+
+            item = dict(items[result_index])
+
+        result = self._enqueue_download(
+            username=item["username"],
+            virtual_path=item["file_path"],
+            folder_path=folder_path,
+            size=item.get("size", 0),
+            file_attributes=item.get("file_attributes"),
+            bypass_filter=bypass_filter,
+        )
+        result["token"] = token
+        result["index"] = result_index
+        return result
 
     def _get_status(self):
         login_status = self.core.users.login_status
